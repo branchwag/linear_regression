@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 burn = { version = "0.21", features = ["ndarray", "autodiff", "train"] }
+plotters = "0.3.7"

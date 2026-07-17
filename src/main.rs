@@ -4,6 +4,8 @@
 //! and stochastic gradient descent, based on the PyTorch `nn.Module` version in
 //! `01_pytorch_workflow.ipynb`.
 
+mod plot;
+
 use burn::backend::{Autodiff, NdArray};
 use burn::module::{Module, Param};
 use burn::optim::momentum::MomentumConfig;
@@ -12,6 +14,7 @@ use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::backend::Backend;
 use burn::tensor::cast::ToElement;
 use burn::tensor::{Distribution, Tensor, TensorData};
+use std::error::Error;
 
 /// The learnable linear regression model: `y = weights * x + bias`.
 ///
@@ -64,6 +67,42 @@ fn params<B: Backend>(model: &LinearRegressionModel<B>) -> (f32, f32) {
     (w, b)
 }
 
+/// Render the per-epoch loss history to a chart. Returns the path written.
+fn chart_loss(train: &[f32], test: &[f32]) -> Result<&'static str, Box<dyn Error>> {
+    const PATH: &str = "plots/loss.png";
+    std::fs::create_dir_all("plots")?;
+    plot::plot_loss_curves(train, test, PATH)?;
+    Ok(PATH)
+}
+
+/// Pair the raw inputs with the ground-truth splits and the model's test
+/// predictions, then render them to a chart. Returns the path written.
+fn chart_predictions<B: Backend>(
+    xs: &[f32],
+    ys: &[f32],
+    split: usize,
+    preds: &Tensor<B, 2>,
+) -> Result<&'static str, Box<dyn Error>> {
+    fn pair(xs: &[f32], ys: &[f32]) -> Vec<(f32, f32)> {
+        xs.iter().copied().zip(ys.iter().copied()).collect()
+    }
+
+    let data = preds.to_data();
+    let pred_ys = data
+        .as_slice::<f32>()
+        .map_err(|e| format!("prediction tensor is not f32: {e:?}"))?;
+
+    const PATH: &str = "plots/predictions.png";
+    std::fs::create_dir_all("plots")?;
+    plot::plot_predictions(
+        &pair(&xs[..split], &ys[..split]),
+        &pair(&xs[split..], &ys[split..]),
+        &pair(&xs[split..], pred_ys),
+        PATH,
+    )?;
+    Ok(PATH)
+}
+
 fn main() {
     // Backend: ndarray with autodiff wrapped around it for gradient tracking.
     type B = Autodiff<NdArray>;
@@ -106,26 +145,33 @@ fn main() {
     let lr = 0.5;
     let epochs = 100;
 
+    // Per-epoch loss history, kept for the loss-curve chart.
+    let mut train_history = Vec::with_capacity(epochs);
+    let mut test_history = Vec::with_capacity(epochs);
+
     for epoch in 0..epochs {
         // Forward pass + loss.
         let pred = model.forward(x_train.clone());
         let loss = mse_loss(pred, y_train.clone());
 
-        // Backprop + gradient descent step.
+        // Backprop + gradient descent step. `backward` borrows, so the loss
+        // tensor is still ours to read afterwards.
         let grads = loss.backward();
+        let train_loss = loss.into_scalar().to_f32();
         let grads = GradientsParams::from_grads(grads, &model);
         model = optimizer.step(lr, model, grads);
 
         // Testing: evaluate on the held-out set (no grad step taken).
         let test_pred = model.forward(x_test.clone());
-        let test_loss = mse_loss(test_pred, y_test.clone());
+        let test_loss = mse_loss(test_pred, y_test.clone()).into_scalar().to_f32();
+
+        train_history.push(train_loss);
+        test_history.push(test_loss);
 
         if epoch % 10 == 0 {
             let (w, b) = params(&model);
             println!(
-                "Epoch: {epoch:>3} | Train loss: {:.5} | Test loss: {:.5} | weights: {w:.4}, bias: {b:.4}",
-                loss.into_scalar(),
-                test_loss.into_scalar(),
+                "Epoch: {epoch:>3} | Train loss: {train_loss:.5} | Test loss: {test_loss:.5} | weights: {w:.4}, bias: {b:.4}"
             );
         }
     }
@@ -135,9 +181,16 @@ fn main() {
     println!("\nLearned params -> weights: {w:.4}, bias: {b:.4}");
     println!("True params    -> weights: {weight:.4}, bias: {bias:.4}");
 
-    // Predictions on the test set.
+    // Predictions on the test set, charted against the ground-truth splits.
     let preds = model.forward(x_test.clone());
-    println!("\nTest predictions:\n{}", preds.to_data());
+    match chart_predictions(&xs, &ys, split, &preds) {
+        Ok(path) => println!("\nWrote predictions chart to {path}"),
+        Err(e) => eprintln!("\nFailed to render predictions chart: {e}"),
+    }
+    match chart_loss(&train_history, &test_history) {
+        Ok(path) => println!("Wrote loss curve chart to {path}"),
+        Err(e) => eprintln!("Failed to render loss curve chart: {e}"),
+    }
 
     // 4. Save the model (cf. torch.save(model.state_dict(), ...)).
     std::fs::create_dir_all("models").expect("failed to create models dir");
